@@ -2,141 +2,128 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.model_selection import train_test_split, RandomizedSearchCV
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, r2_score
-from scipy.stats import uniform, randint
-from math import exp, log
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.ensemble import RandomForestClassifier # MUDANÇA: CLASSIFIER
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report # NOVAS MÉTRICAS
 
+# --- CONFIGURAÇÕES E VARIÁVEIS GLOBAIS ---
+dataset_path = "C:\\Users\\timot\\OneDrive\\Área de Trabalho\\Aulas 2025\\inteligencia artificial 2\\source\\static\\dataset.csv"
+TARGET_ORIGINAL = 'salary_in_usd'
+TARGET_CLASS = 'salary_class' # Novo target binário
+TOP_N_JOBS = 15
+MIN_SALARY = 5000
+MAX_SALARY = 500000
 
-dataset_path = "C:\\Users\\timot\\OneDrive\\Área de Trabalho\\Aulas 2025\\inteligencia artificial 2\\dataset.csv"
-
-# --- 1. Load Data and Select Features ---
-# Assume your dataset file is named 'ds_salaries.csv'
+# --- 1. Load Data, Outlier Management e DISCRETIZAÇÃO ---
 try:
     df = pd.read_csv(dataset_path)
 except FileNotFoundError:
-    print("Error: ds_salaries.csv not found. Please check the file path.")
+    print(f"Erro: O arquivo {dataset_path} não foi encontrado.")
     exit()
 
-# Features for prediction (X) and Target variable (y)
-FEATURES = [
-    'experience_level', 
-    'job_title', 
-    'company_size', 
-    'work_year',
-    'employee_residence', 
-    'company_location', 
-    'remote_ratio' 
-]
-TARGET = 'salary_in_usd'
+# A. Outlier Management (Remoção)
+df_model = df[
+    (df[TARGET_ORIGINAL] >= MIN_SALARY) & 
+    (df[TARGET_ORIGINAL] <= MAX_SALARY)
+].copy()
 
-df_model = df[FEATURES + [TARGET]].copy()
+# B. DISCRETIZAÇÃO: Criando a Classe Salarial
+# Calcule o limite (mediana) APENAS nos dados de treinamento para evitar data leakage
+# Usamos o 80/20 temporário apenas para calcular a mediana corretamente
+df_train_temp, _ = train_test_split(df_model, test_size=0.2, random_state=42)
+SALARY_THRESHOLD = df_train_temp[TARGET_ORIGINAL].median()
 
-# A. Convert 'remote_ratio' from percentage (0, 50, 100) to categorical string
+# Cria a nova coluna Target binária: 1 (Alto) se > Limite, 0 (Baixo) se <= Limite
+df_model[TARGET_CLASS] = (df_model[TARGET_ORIGINAL] > SALARY_THRESHOLD).astype(int)
+
+print(f"\n--- Estratégia de Classificação ---")
+print(f"Limite Salarial (Mediana): ${SALARY_THRESHOLD:,.2f}")
+print(f"Target: Prever se o salário é ALTO (1) ou BAIXO (0).")
+
+
+# C. Feature Engineering (Mantido igual)
+job_counts = df_model['job_title'].value_counts()
+top_jobs_list = job_counts.index[:TOP_N_JOBS].tolist()
+
+df_model['job_title_grouped'] = df_model['job_title'].apply(
+    lambda x: x if x in top_jobs_list else 'Other_Job_Title'
+)
+
+US_COUNTRIES = ['US', 'USA']
+df_model['is_usa_company'] = df_model['company_location'].apply(
+    lambda x: 1 if x in US_COUNTRIES else 0
+)
+df_model['exp_level_usa'] = df_model['experience_level'] + "_" + df_model['is_usa_company'].astype(str)
 df_model['remote_ratio'] = df_model['remote_ratio'].astype(str)
 
-# B. Log Transform the Target Variable (Salary)
-# This reduces the impact of outliers and normalizes the target distribution.
-# Add 1 before log to handle any potential zero values, though salaries are > 0.
-df_model[TARGET] = np.log1p(df_model[TARGET]) 
-
-# C. One-Hot Encoding for all Categorical Features
-# 'drop_first=True' helps prevent multicollinearity.
-categorical_features = [
-    'experience_level', 
-    'job_title', 
-    'company_size', 
-    'employee_residence', 
-    'company_location', 
-    'remote_ratio'
+# D. Seleção Final e One-Hot Encoding
+FINAL_FEATURES = [
+    'work_year', 'is_usa_company', 'remote_ratio', 'company_size', 
+    'job_title_grouped', 'exp_level_usa'
 ]
-df_encoded = pd.get_dummies(df_model, columns=categorical_features, drop_first=True)
 
-# Remove the original target column and define X and y
-X = df_encoded.drop(columns=[TARGET])
-y = df_encoded[TARGET]
+# Usamos o Target de CLASSIFICAÇÃO para definir X e y
+df_encoded = pd.get_dummies(df_model[FINAL_FEATURES + [TARGET_CLASS]], 
+                            columns=['remote_ratio', 'company_size', 'job_title_grouped', 'exp_level_usa'], 
+                            drop_first=True)
+
+# O Target original (em USD) é descartado, usamos o Target de CLASSE
+X = df_encoded.drop(columns=[TARGET_CLASS])
+y = df_encoded[TARGET_CLASS]
+
 
 # --- 2. Splitting Data ---
 X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.2, random_state=42
 )
 
-print(f"Training set size: {len(X_train)} | Testing set size: {len(X_test)}")
-print(f"Total features after encoding: {X.shape[1]}")
 
-# --- 3. Hyperparameter Tuning (Randomized Search) ---
+# --- 3. Hyperparameter Tuning (Grid Search para Classificação) ---
+rf_base = RandomForestClassifier(random_state=42, n_jobs=-1) # MUDANÇA: CLASSIFIER
 
-# Define the model and the parameter distribution for the search
-rf_base = RandomForestRegressor(random_state=42, n_jobs=-1)
-
-param_dist = {
-    'n_estimators': randint(100, 200, 300),    # Number of trees
-    'max_depth': randint(10, 50),              # Max depth of each tree
-    'min_samples_split': randint(2, 10),       # Min samples required to split a node
-    'min_samples_leaf': randint(1, 5),         # Min samples required at a leaf node
-    'max_features': ['sqrt', 'log2', 0.8]      # Number of features to consider for best split
+param_grid = {
+    'n_estimators': [100, 200],         
+    'max_depth': [20, 30],            
+    'min_samples_split': [5, 10],      
+    'class_weight': ['balanced', None] # Novo parâmetro para lidar com classes desbalanceadas
 }
 
-# Use RandomizedSearchCV to efficiently find good hyperparameters
-random_search = RandomizedSearchCV(
+# Otimizamos pelo F1-score (bom equilíbrio entre Precisão e Recall)
+grid_search = GridSearchCV(
     estimator=rf_base, 
-    param_distributions=param_dist, 
-    n_iter=5, 
-    cv=3,
+    param_grid=param_grid, 
+    cv=5,                 
+    scoring='f1',         # MUDANÇA: Otimizando pelo F1-score
     verbose=0, 
-    random_state=42, 
-    n_jobs=-1
+    n_jobs=-1             
 )
 
-print("\nStarting Hyperparameter Tuning...")
-random_search.fit(X_train, y_train)
-best_model = random_search.best_estimator_
+print("\n--- INICIANDO GRID SEARCH PARA CLASSIFICAÇÃO ---")
+grid_search.fit(X_train, y_train)
+best_model = grid_search.best_estimator_
+print("Tuning completo. Melhores parâmetros encontrados:", grid_search.best_params_)
 
-print("Tuning complete. Best parameters found:")
-print(random_search.best_params_)
+# --- 4. Prediction and Evaluation (Métricas de Classificação) ---
 
-# --- 4. Prediction and Evaluation ---
+y_pred = best_model.predict(X_test)
 
-# Make predictions using the best model
-y_pred_log = best_model.predict(X_test)
+# A. Acurácia
+accuracy = accuracy_score(y_test, y_pred)
 
-# Reverse the Log Transformation for meaningful MAE/R2 calculation
-y_test_actual = np.expm1(y_test)
-y_pred_actual = np.expm1(y_pred_log)
-
-# Calculate evaluation metrics
-mae = mean_absolute_error(y_test_actual, y_pred_actual)
-r2 = r2_score(y_test_actual, y_pred_actual)
-
-print("\n--- Model Evaluation (After Tuning and Log-Transform) ---")
-print(f"Mean Absolute Error (MAE): ${mae:,.2f} (Average prediction error in USD)")
-print(f"R-squared (R2) Score: {r2:.4f} (Variance explained)")
-
-# --- 5. Visualization ---
-
-# A. Feature Importance Plot (using the best model)
-importances = best_model.feature_importances_
-feature_names = X.columns
-# Combine feature importances with their names and select top 15
-forest_importances = pd.Series(importances, index=feature_names).sort_values(ascending=False).head(15)
-
-plt.figure(figsize=(10, 7))
-sns.barplot(x=forest_importances, y=forest_importances.index)
-plt.title('Top 15 Random Forest Feature Importance')
-plt.xlabel('Relative Importance')
-plt.tight_layout()
+# B. Matriz de Confusão
+conf_matrix = confusion_matrix(y_test, y_pred)
+sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', 
+            xticklabels=['Baixo (0)', 'Alto (1)'], yticklabels=['Baixo (0)', 'Alto (1)'])
+plt.title('Matriz de Confusão')
+plt.ylabel('Real')
+plt.xlabel('Previsto')
 plt.show()
 
-# B. Actual vs. Predicted Salaries Plot
-plt.figure(figsize=(8, 8))
-plt.scatter(y_test_actual, y_pred_actual, alpha=0.6)
-# Define a range for the diagonal line based on actual values
-min_val = min(y_test_actual.min(), y_pred_actual.min())
-max_val = max(y_test_actual.max(), y_pred_actual.max())
-plt.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2) 
-plt.xlabel('Actual Salaries (USD)')
-plt.ylabel('Predicted Salaries (USD)')
-plt.title('Actual vs. Predicted Salaries (USD)')
-plt.grid(True)
-plt.show()
+# C. Relatório Completo
+report = classification_report(y_test, y_pred)
+
+
+print("\n--- AVALIAÇÃO DO MODELO DE CLASSIFICAÇÃO ---")
+print(f"Acurácia Geral: {accuracy:.4f}")
+print("\n--- Relatório de Classificação ---")
+print(report)
